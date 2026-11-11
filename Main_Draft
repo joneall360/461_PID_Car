@@ -1,0 +1,346 @@
+/*
+ * EENG 461 - RC car TM4C123GH6PM - car-side rough draft
+ *
+ * 32-BIT INPUT :
+ * bits  0-11: raw joystick X, 0-4095
+ * bits 12-13: mode: 0 joystick, 1 D-pad, 2 automatic, 3 unset
+ * bits 14-15: reserved, must be 0
+ * bits 16-27: raw joystick Y, 0-4095
+ * bits 28-31: D-pad: UP, DOWN, LEFT, RIGHT respectively
+ *
+ * H-bridge with IN1/IN2 and active-high PWM enable. Verify driver first.
+ * PA2=IN1; PA3=IN2; PB6=M0PWM0 motor enable; PB4=M0PWM2 servo signal.
+ */
+#include <stdint.h>
+#include <stdbool.h>
+#include "inc/hw_memmap.h"
+#include "inc/hw_ints.h"
+#include "driverlib/sysctl.h"
+#include "driverlib/gpio.h"
+#include "driverlib/pin_map.h"
+#include "driverlib/pwm.h"
+#include "driverlib/timer.h"
+#include "driverlib/interrupt.h"
+
+#define SYS_CLOCK_HZ         16000000UL
+#define PWM_CLOCK_HZ         (SYS_CLOCK_HZ / 8UL)
+#define MOTOR_PERIOD         (PWM_CLOCK_HZ / 1000UL) /* Proposed 1 kHz */
+#define SERVO_PERIOD         (PWM_CLOCK_HZ / 50UL)   /* 20 ms */
+#define CONTROL_PERIOD_MS    5UL
+#define REVERSE_PAUSE_MS     100UL /* Needs adjusted. */
+#define X_CENTER             2048L
+#define Y_CENTER             2048L
+#define DEAD_BAND            100L
+#define REVERSE_X            0
+#define REVERSE_Y            0
+#define SERVO_LEFT_US        1000L /* Calibrate linkage travel. */
+#define SERVO_CENTER_US      1500L
+#define SERVO_RIGHT_US       2000L
+#define MAX_MOTOR_REQUEST    8000L /* 80% duty. */
+#define DPAD_MOTOR_REQUEST   5000L /* Fixed 50% duty, either direction. */
+#define DPAD_STEER_REQUEST   10000L /* Full calibrated left/right. */
+
+#define MODE_JOYSTICK        0U
+#define MODE_DPAD            1U
+#define MODE_AUTOMATIC       2U
+#define DPAD_UP              0x01U
+#define DPAD_DOWN            0x02U
+#define DPAD_LEFT            0x04U
+#define DPAD_RIGHT           0x08U
+#define NEUTRAL_DATA         0x08000800UL /* X=2048, Y=2048, mode=joystick */
+
+/* Automatic routines are LOCAL selections for now, not extra input bits. */
+#define AUTO_WHEELIE         0U
+#define AUTO_FUTURE_1        1U
+#define AUTO_FUTURE_2        2U
+
+volatile uint32_t input_data = NEUTRAL_DATA;
+volatile bool input_enable = false;
+volatile uint8_t automatic_routine = AUTO_WHEELIE;
+volatile int32_t debug_motor_request = 0;
+volatile uint32_t debug_servo_us = SERVO_CENTER_US;
+static volatile uint32_t milliseconds = 0;
+
+typedef struct {
+    uint16_t x, y;
+    uint8_t buttons, mode;
+    bool valid;
+} CarInput;
+
+/* Extract numeric fields from the already-assembled 32-bit value. */
+static CarInput Decode_Input(uint32_t data)
+{
+    CarInput in;
+    in.x = (uint16_t)(data & 0x0FFFUL);
+    in.y = (uint16_t)((data >> 16) & 0x0FFFUL);
+    in.buttons = (uint8_t)((data >> 28) & 0x0FUL);
+    in.mode = (uint8_t)((data >> 12) & 0x03UL);
+    in.valid = ((data & 0x0000C000UL) == 0UL) && (in.mode != 3U);
+    return in;
+}
+
+/* Raw ADC -> signed -10000..+10000, preserving the 12-bit input.
+ * Defaults: 0-1947 negative; 1948-2148 neutral; 2149-4095 positive.
+ * X negative=left, positive=right. Y negative=reverse, positive=forward.
+ */
+static int32_t Map_Axis(uint16_t raw, int32_t center)
+{
+    int32_t low = center - DEAD_BAND;
+    int32_t high = center + DEAD_BAND;
+    if ((int32_t)raw < low) return -((low - raw) * 10000L) / low;
+    if ((int32_t)raw > high) return (((int32_t)raw - high) * 10000L) / (4095L - high);
+    return 0;
+}
+
+/* Joystick gives variable steering; D-pad gives fixed left/right travel.
+ * Opposing left+right cancel only steering. Up/down remain independent.
+ */
+static int32_t Manual_Steering(CarInput in)
+{
+    int32_t request = 0;
+    if (!in.valid) return 0;
+    if (in.mode == MODE_JOYSTICK) {
+        request = Map_Axis(in.x, X_CENTER);
+#if REVERSE_X
+        request = -request;
+#endif
+    } else if (in.mode == MODE_DPAD) {
+        request = (((in.buttons & DPAD_RIGHT) != 0U) -
+                   ((in.buttons & DPAD_LEFT) != 0U)) * DPAD_STEER_REQUEST;
+    }
+    return request;
+}
+
+/* Joystick gives variable drive; D-pad gives fixed forward/reverse duty.
+ * Up+down cancels drive only. Releasing both requests stop.
+ */
+static int32_t Manual_Throttle(CarInput in)
+{
+    int32_t request = 0;
+    if (!in.valid) return 0;
+    if (in.mode == MODE_JOYSTICK) {
+        request = Map_Axis(in.y, Y_CENTER);
+#if REVERSE_Y
+        request = -request;
+#endif
+    } else if (in.mode == MODE_DPAD) {
+        request = (((in.buttons & DPAD_UP) != 0U) -
+                   ((in.buttons & DPAD_DOWN) != 0U)) * DPAD_MOTOR_REQUEST;
+    }
+    return request;
+}
+
+/* Signed steering request -> servo pulse duration in microseconds. */
+static uint32_t Steering_Pulse(int32_t request)
+{
+    if (request > 10000L) request = 10000L;
+    if (request < -10000L) request = -10000L;
+    if (request < 0) return (uint32_t)(SERVO_CENTER_US +
+        ((SERVO_LEFT_US - SERVO_CENTER_US) * (-request)) / 10000L);
+    return (uint32_t)(SERVO_CENTER_US +
+        ((SERVO_RIGHT_US - SERVO_CENTER_US) * request) / 10000L);
+}
+
+#ifndef HOST_TEST
+#define MOTOR_IN1 GPIO_PIN_2
+#define MOTOR_IN2 GPIO_PIN_3
+#define MOTOR_PINS (MOTOR_IN1 | MOTOR_IN2)
+static int32_t last_direction = 0;
+static bool motor_running = false;
+static uint32_t stopped_ms = 0;
+
+/* Disable H-bridge enable and clear both direction pins. */
+static void Motor_Stop(void)
+{
+    PWMOutputState(PWM0_BASE, PWM_OUT_0_BIT, false);
+    GPIOPinWrite(GPIO_PORTA_BASE, MOTOR_PINS, 0);
+    if (motor_running) stopped_ms = milliseconds;
+    motor_running = false;
+}
+
+/* Low-level servo output shared by manual and future automatic control. */
+static void Set_Steering(int32_t request)
+{
+    uint32_t pulse = Steering_Pulse(request);
+    debug_servo_us = pulse;
+    PWMPulseWidthSet(PWM0_BASE, PWM_OUT_2,
+                    pulse * (PWM_CLOCK_HZ / 1000000UL));
+}
+
+/* Signed duty in hundredths of percent -> H-bridge direction and PWM.
+ * A reversal first disables drive for the proposed pause interval.
+ */
+static void Set_Rear_Axle(int32_t request)
+{
+    uint32_t magnitude, width;
+    int32_t direction;
+    if (request > MAX_MOTOR_REQUEST) request = MAX_MOTOR_REQUEST;
+    if (request < -MAX_MOTOR_REQUEST) request = -MAX_MOTOR_REQUEST;
+    debug_motor_request = request;
+    if (request == 0) { Motor_Stop(); return; }
+    direction = request > 0 ? 1 : -1;
+    if (last_direction != 0 && direction != last_direction) {
+        Motor_Stop();
+        if ((uint32_t)(milliseconds - stopped_ms) < REVERSE_PAUSE_MS) return;
+    }
+    if (direction != last_direction || !motor_running) {
+        GPIOPinWrite(GPIO_PORTA_BASE, MOTOR_PINS,
+                     direction > 0 ? MOTOR_IN1 : MOTOR_IN2);
+    }
+    magnitude = (uint32_t)(request > 0 ? request : -request);
+    width = (MOTOR_PERIOD * magnitude) / 10000UL;
+    if (width < 1UL) width = 1UL;
+    if (width >= MOTOR_PERIOD) width = MOTOR_PERIOD - 1UL;
+    PWMPulseWidthSet(PWM0_BASE, PWM_OUT_0, width);
+    PWMOutputState(PWM0_BASE, PWM_OUT_0_BIT, true);
+    last_direction = direction;
+    motor_running = true;
+}
+
+/* Decode the 32-bit data, map manual X/D-pad, and drive the servo. */
+void def_run_steer(uint32_t data)
+{
+    Set_Steering(Manual_Steering(Decode_Input(data)));
+}
+
+/* Decode the 32-bit data, map manual Y/D-pad, and drive the rear axle. */
+void def_run_rear_axle(uint32_t data)
+{
+    Set_Rear_Axle(Manual_Throttle(Decode_Input(data)));
+}
+
+/* MANUAL MODE: both output calls run each update, allowing drive + turn. */
+static void Manual_Drive(uint32_t data)
+{
+    def_run_steer(data);
+    def_run_rear_axle(data);
+}
+
+/* AUTOMATIC ROUTINE PLACEHOLDER: one step above pseudocode. */
+static void Wheelie_PID_Draft(uint32_t data)
+{
+    (void)data; /* Reserved for future request/cancel. */
+    Set_Steering(0);
+    Set_Rear_Axle(0);
+}
+
+/* Slots for later automatic routines. */
+static void Future_Routine_1(uint32_t data)
+{
+    (void)data;
+    Set_Steering(0);
+    Set_Rear_Axle(0);
+}
+static void Future_Routine_2(uint32_t data)
+{
+    (void)data;
+    Set_Steering(0);
+    Set_Rear_Axle(0);
+}
+
+/* AUTOMATED MODE: selected feedback routine owns both motor outputs. */
+static void Automated_Drive(uint32_t data)
+{
+    switch (automatic_routine) {
+    case AUTO_WHEELIE: Wheelie_PID_Draft(data); break;
+    case AUTO_FUTURE_1: Future_Routine_1(data); break;
+    case AUTO_FUTURE_2: Future_Routine_2(data); break;
+    default: Set_Steering(0); Set_Rear_Axle(0); break;
+    }
+}
+
+/* CONTROL DRAFT: validate, choose the mode, and call its output path.
+ * Mode bits select behavior directly; no Button-1 wheelie shortcut remains
+ * because that button now means UP in the D-pad.
+ */
+static void Run_Control(uint32_t data)
+{
+    CarInput in = Decode_Input(data);
+    if (!in.valid) {
+        Set_Steering(0);
+        Set_Rear_Axle(0);
+        return;
+    }
+    switch (in.mode) {
+    case MODE_JOYSTICK:
+    case MODE_DPAD:
+        Manual_Drive(data);
+        break;
+    case MODE_AUTOMATIC:
+        Automated_Drive(data);
+        break;
+    default:
+        Set_Steering(0);
+        Set_Rear_Axle(0);
+        break;
+    }
+}
+
+/* Configure independent motor/servo PWM generators, starting stopped. */
+static void Config_Motor_Servo(void)
+{
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOA);
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOB);
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_PWM0);
+    while (!SysCtlPeripheralReady(SYSCTL_PERIPH_GPIOA)) {}
+    while (!SysCtlPeripheralReady(SYSCTL_PERIPH_GPIOB)) {}
+    while (!SysCtlPeripheralReady(SYSCTL_PERIPH_PWM0)) {}
+    GPIOPinTypeGPIOOutput(GPIO_PORTA_BASE, MOTOR_PINS);
+    GPIOPinWrite(GPIO_PORTA_BASE, MOTOR_PINS, 0);
+    SysCtlPWMClockSet(SYSCTL_PWMDIV_8);
+    PWMOutputState(PWM0_BASE, PWM_OUT_0_BIT | PWM_OUT_2_BIT, false);
+    GPIOPinConfigure(GPIO_PB6_M0PWM0);
+    GPIOPinConfigure(GPIO_PB4_M0PWM2);
+    GPIOPinTypePWM(GPIO_PORTB_BASE, GPIO_PIN_6 | GPIO_PIN_4);
+    PWMOutputInvert(PWM0_BASE, PWM_OUT_0_BIT | PWM_OUT_2_BIT, false);
+    PWMGenConfigure(PWM0_BASE, PWM_GEN_0, PWM_GEN_MODE_DOWN | PWM_GEN_MODE_NO_SYNC);
+    PWMGenConfigure(PWM0_BASE, PWM_GEN_1, PWM_GEN_MODE_DOWN | PWM_GEN_MODE_NO_SYNC);
+    PWMGenPeriodSet(PWM0_BASE, PWM_GEN_0, MOTOR_PERIOD);
+    PWMGenPeriodSet(PWM0_BASE, PWM_GEN_1, SERVO_PERIOD);
+    PWMPulseWidthSet(PWM0_BASE, PWM_OUT_0, 1);
+    Set_Steering(0);
+    PWMGenEnable(PWM0_BASE, PWM_GEN_0);
+    PWMGenEnable(PWM0_BASE, PWM_GEN_1);
+    PWMOutputState(PWM0_BASE, PWM_OUT_2_BIT, true);
+}
+
+/* Timer ISR only updates time. */
+void Timer0A_Handler(void)
+{
+    TimerIntClear(TIMER0_BASE, TIMER_TIMA_TIMEOUT);
+    milliseconds++;
+}
+static void Config_Timer0A(void)
+{
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_TIMER0);
+    while (!SysCtlPeripheralReady(SYSCTL_PERIPH_TIMER0)) {}
+    TimerConfigure(TIMER0_BASE, TIMER_CFG_PERIODIC);
+    TimerLoadSet(TIMER0_BASE, TIMER_A, SYS_CLOCK_HZ / 1000UL - 1UL);
+    TimerIntRegister(TIMER0_BASE, TIMER_A, Timer0A_Handler);
+    TimerIntClear(TIMER0_BASE, TIMER_TIMA_TIMEOUT);
+    TimerIntEnable(TIMER0_BASE, TIMER_TIMA_TIMEOUT);
+    IntEnable(INT_TIMER0A);
+}
+
+int main(void)
+{
+    uint32_t now, previous = 0;
+    SysCtlClockSet(SYSCTL_SYSDIV_1 | SYSCTL_USE_OSC |
+                  SYSCTL_OSC_MAIN | SYSCTL_XTAL_16MHZ);
+    Config_Motor_Servo();
+    Config_Timer0A();
+    IntMasterEnable();
+    TimerEnable(TIMER0_BASE, TIMER_A);
+    while (1) {
+        now = milliseconds;
+        if ((uint32_t)(now - previous) < CONTROL_PERIOD_MS) continue;
+        previous = now;
+        if (input_enable) {
+            Run_Control(input_data);
+        } else {
+            Set_Steering(0);
+            Set_Rear_Axle(0);
+        }
+    }
+}
+
